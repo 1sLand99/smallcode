@@ -119,7 +119,12 @@ class SmallCode extends EventEmitter {
               continue;
             }
 
-            const toolResult = await this._executeTool(toolName, toolArgs);
+            let toolResult = await this._executeTool(toolName, toolArgs);
+            // TDD post-write hook (same as bin/executor.js wrapper)
+            const TDD_WRITE_TOOLS = new Set(['write_file', 'patch', 'append_file', 'read_and_patch']);
+            if (TDD_WRITE_TOOLS.has(toolName) && toolResult && !toolResult.error) {
+              toolResult = await this._tddPostWrite(toolArgs && (toolArgs.path || ''), toolResult);
+            }
             const toolMs = Date.now() - toolStart;
 
             this.emit('tool_end', { name: toolName, result: toolResult, ms: toolMs });
@@ -238,17 +243,35 @@ Rules:
       { type: 'function', function: { name: 'search', description: 'Search file contents using regex. Returns matching lines.', parameters: { type: 'object', properties: { pattern: { type: 'string', description: 'Regex pattern' } }, required: ['pattern'] } } },
       { type: 'function', function: { name: 'find_files', description: 'Find files matching a glob pattern.', parameters: { type: 'object', properties: { pattern: { type: 'string', description: 'Glob pattern' } }, required: ['pattern'] } } },
       { type: 'function', function: { name: 'run_tests', description: 'Run the project\'s test suite and return structured results: pass/fail counts and per-failing-test names and messages.', parameters: { type: 'object', properties: { test_filter: { type: 'string', description: 'Optional: run only tests matching this pattern.' } }, required: [] } } },
-      { type: 'function', function: { name: 'tdd_loop', description: 'Start a TDD loop for a list of requirements. Loops through Red→Green→(Refactor) for each requirement until all pass.', parameters: { type: 'object', properties: { requirements: { type: 'array', items: { type: 'string' }, description: 'List of requirements.' } }, required: ['requirements'] } } },
-      { type: 'function', function: { name: 'tdd_begin_cycle', description: 'Start a TDD cycle for a named test, entering the RED phase.', parameters: { type: 'object', properties: { test_name: { type: 'string', description: 'Test identifier to track.' } }, required: ['test_name'] } } },
-      { type: 'function', function: { name: 'tdd_status', description: 'Show current TDD phase and target test.', parameters: { type: 'object', properties: {}, required: [] } } },
-      { type: 'function', function: { name: 'tdd_advance', description: 'Advance the TDD cycle to the next phase.', parameters: { type: 'object', properties: { skip_refactor: { type: 'boolean' } }, required: [] } } },
-      { type: 'function', function: { name: 'tdd_reset', description: 'Reset TDD state to idle.', parameters: { type: 'object', properties: {}, required: [] } } },
+      { type: 'function', function: { name: 'tdd_loop', description: 'Start a TDD loop for a list of requirements. Harness enforces Red→Green automatically on every file write.', parameters: { type: 'object', properties: { requirements: { type: 'array', items: { type: 'string' } } }, required: ['requirements'] } } },
+      { type: 'function', function: { name: 'tdd_status', description: 'Show current TDD phase and requirements checklist.', parameters: { type: 'object', properties: {}, required: [] } } },
     ];
 
     if (this.config.tools) {
       return tools.filter(t => this.config.tools.includes(t.function.name));
     }
     return tools;
+  }
+
+  async _tddPostWrite(filePath, toolResult) {
+    try {
+      const { getTDDState, _isTestFile } = require('./session/tdd_state');
+      const tdd = getTDDState({ workdir: this.config.cwd });
+      if (!tdd.loopActive) return toolResult;
+      const { runTests, formatResult } = require('./tools/run_tests');
+      const { getTDDGovernor } = require('./governor/tdd_governor');
+      const filter = (!tdd.isRefactor() && !tdd.allRequirementsDone() && tdd.targetTest) ? tdd.targetTest : null;
+      const testResult = runTests({ workdir: this.config.cwd, test_filter: filter || undefined });
+      if (tdd.isIdle() && _isTestFile(filePath || '') && (testResult.failed > 0 || testResult.errors > 0)) {
+        const name = (testResult.failures[0] && testResult.failures[0].name) || 'new test';
+        tdd.beginCycle(name);
+      }
+      const tddMsg = getTDDGovernor({ workdir: this.config.cwd }).processTestResult(testResult);
+      const note = `\n\n[harness] run_tests: ${testResult.summary}${tddMsg ? '\n[TDD] ' + tddMsg : ''}`;
+      return { ...toolResult, result: (toolResult.result || '') + note };
+    } catch {
+      return toolResult;
+    }
   }
 
   async _executeTool(name, args) {

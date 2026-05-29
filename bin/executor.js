@@ -945,4 +945,62 @@ async function executeTool(name, args, ctx) {
   }
 }
 
-module.exports = { executeTool };
+// ─── TDD harness post-write hook ─────────────────────────────────────────────
+//
+// Called after every successful file write while a TDD loop is active.
+// Runs run_tests automatically (filtered to target test when in RED/GREEN,
+// full suite in REFACTOR or when all requirements are done) and drives
+// phase transitions without requiring the model to call any TDD tools.
+//
+// Also auto-begins a cycle when: loop active + idle + test file written +
+// tests are newly failing. This means the model never needs to call
+// tdd_begin_cycle explicitly.
+
+async function _tddPostWrite(filePath, toolResult, cwd) {
+  try {
+    const { getTDDState, _isTestFile } = require('../src/session/tdd_state');
+    const tdd = getTDDState({ workdir: cwd });
+    if (!tdd.loopActive) return toolResult;
+
+    const { runTests, formatResult } = require('../src/tools/run_tests');
+    const { getTDDGovernor } = require('../src/governor/tdd_governor');
+
+    const isTestFile = _isTestFile(filePath || '');
+    const isRefactor = tdd.isRefactor();
+    const allDone = tdd.allRequirementsDone();
+
+    // Choose filter: target test while in cycle, full suite for refactor/done
+    const filter = (!isRefactor && !allDone && tdd.targetTest) ? tdd.targetTest : null;
+    const testResult = runTests({ workdir: cwd, test_filter: filter || undefined });
+
+    // Auto-begin cycle: idle + test file written + failures detected
+    if (tdd.isIdle() && isTestFile && (testResult.failed > 0 || testResult.errors > 0)) {
+      const inferredName = (testResult.failures[0] && testResult.failures[0].name) || 'new test';
+      tdd.beginCycle(inferredName);
+      // Re-run processTestResult so confirmRed fires on this same result
+    }
+
+    const gov = getTDDGovernor({ workdir: cwd });
+    const tddMsg = gov.processTestResult(testResult);
+
+    const testSummary = `\n\n[harness] run_tests: ${testResult.summary}${tddMsg ? '\n[TDD] ' + tddMsg : ''}`;
+    return { ...toolResult, result: (toolResult.result || '') + testSummary };
+  } catch {
+    return toolResult; // never fail the write because of TDD auto-check
+  }
+}
+
+// Wrap executeTool so the TDD post-write hook fires automatically.
+// This keeps the hook out of every individual tool case.
+const _executeToolRaw = executeTool;
+async function executeToolWithTDD(name, args, ctx) {
+  const result = await _executeToolRaw(name, args, ctx);
+  const WRITE_TOOLS = new Set(['write_file', 'patch', 'append_file', 'read_and_patch']);
+  if (WRITE_TOOLS.has(name) && result && !result.error) {
+    const filePath = args && (args.path || '');
+    return _tddPostWrite(filePath, result, process.cwd());
+  }
+  return result;
+}
+
+module.exports = { executeTool: executeToolWithTDD };
